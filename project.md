@@ -1,6 +1,72 @@
-# Implementation plan for the Logos LSP + VS Code extension
+# Logos LSP and VS Code extension — spec and implementation plan
 
-This document briefs the agent that will build this project. Read [init.md](init.md) first — that is the feature spec. This file is the *how*.
+This document is the single source of truth for what we're building and how. It briefs the agent that will implement the project.
+
+## Overview
+
+[Logos](https://theos.dev/docs/logos) is a regex-based preprocessor for Objective-C method swizzling code, used in Theos for jailbreak tweak development. There is no language server for it. This project builds one, plus a VS Code extension that wraps it. The two pieces don't have to live in the same repo forever, but for v1 they do.
+
+The extension targets Theos tweak developers but must also work on loose `.x` / `.xm` / `.m` / `.mm` / `.h` files outside any project — see [Standalone behavior](#standalone-no-project-behavior).
+
+## Feature requirements
+
+### Original requirements (the spec the user wrote)
+
+The extension should enable the user to…
+
+1. **Command-click any import statement to open the relevant header.**
+    - Including headers outside the project — e.g., clicking `#import <Foundation/Foundation.h>` opens `Foundation.h`, from which another header can also be clicked. This makes navigation through SDK headers a real workflow, not just "open the project's own files."
+2. **Autocomplete class and method names, including `%new` methods, and jump to symbol/method/class.**
+    - Right-click → jump to definition, plus "go to symbol" globally.
+    - Requires indexing types and methods within the project.
+3. **Autocomplete Logos keywords.**
+4. **Autocomplete rules and resources in the Makefile.**
+5. **Show compile errors inline as-you-type**, assuming the project has a Makefile that compiles the current file.
+    - This may require a build server or something similarly involved.
+6. **First-class debugger support for any Theos project on a target device.**
+    - Also support launching or attaching to arbitrary apps and processes.
+
+### Logos-specific language features
+
+7. **Syntax highlighting** for all Logos directives (`%hook`, `%end`, `%orig`, `%new`, `%log`, `%ctor`, `%dtor`, `%init`, `%c`, `%group`, `%subclass`, `%property`, `%config`).
+8. **Block structure validation**: detect unclosed `%hook`/`%group`/`%subclass`, auto-pair `%end`, fold blocks in the gutter.
+9. **Semantic diagnostics** unique to Logos:
+    - `%orig` used inside a `%new` method (no original exists)
+    - Hooking a method that doesn't exist on the target class (with a "did you mean…" quick fix, or a quick fix to convert to `%new`)
+    - Selector signature mismatch vs. the real method (wrong arg count/types)
+    - `%init` called outside `%ctor` / before `%group` is declared
+10. **Hover info**: show the real Objective-C method signature being hooked, where it came from (which header/framework), and a preview of what the Logos block expands to.
+11. **Snippets** for common scaffolds (`%hook ClassName … %end`, `%new` method with proper type encoding, `%ctor` blocks, `%subclass` with `%property`).
+12. **Inline expansion preview** — show what code Logos generates for the current block.
+
+### Header / symbol indexing
+
+13. **SDK + private framework indexing** (iOS SDK, PrivateFrameworks dumps via `theos/sdks` or class-dump headers) so completion works for Apple's own classes, not just project-local ones.
+14. **Auto-import** missing headers when you reference an unknown class.
+15. **Generate `@interface` stub** for a hooked class — pull from class-dump output or runtime introspection so private methods become known to the indexer.
+
+### Theos / Makefile integration
+
+16. **Detect Theos project root** (presence of `theos`/`$THEOS` and a tweak `Makefile`) and surface it as a workspace concept.
+17. **Tasks/commands** for `make`, `make do`, `make package`, `make install`, with device picker (pairs with #6).
+18. **Validate `control` file and `Filter.plist`** — bundle ID format, required fields, architecture lists.
+19. **Variable completion** for known Theos Makefile variables (`TARGET`, `ARCHS`, `INSTALL_TARGET_PROCESSES`, `_FILES`, `_FRAMEWORKS`, `_LIBRARIES`, `_CFLAGS`, etc.) with hover docs.
+
+### Device / runtime tooling (extends #6)
+
+20. **SSH device manager**: configure, test, and pick devices; reuse for install + debug.
+21. **Live tweak log viewer** — tail `oslog`/`syslog` filtered to the tweak's process.
+22. **Crash log symbolication** for installed tweaks.
+
+### Project scaffolding
+
+23. **Wrap `nic.pl`** in a "New Theos Project" command (tweak, app, tool, prefs, library templates).
+
+### Editor niceties
+
+24. **Rename refactor** for hooked methods/classes across all `%hook` blocks and `%c()` references.
+25. **Format on save** (delegating ObjC bodies to clang-format, preserving Logos directives).
+26. **Doc hover for Logos keywords** linking to the relevant section on theos.dev.
 
 ## Architecture decision (already made)
 
@@ -39,10 +105,13 @@ Clangd owns:
 | Debugger backend | **Wrap CodeLLDB (`vadimcn.vscode-lldb`)** | Declare as a VS Code extension dependency. Our work is launch.json templates, SSH/iproxy/debugserver plumbing, device manager, and a "Debug This Tweak" command. CodeLLDB owns the DAP surface. |
 | Language ID | **`logos`** | Single ID for `.x` / `.xm` / `.xi` / `.xmi`. Embedded ObjC scopes inherit from `source.objc.*`. Default; revisit only if it collides with another extension. |
 | Multi-window safety | **File lock on shared cache** | The SDK index bootstrap cache is shared across VS Code windows. Acquire a lock; if another window's bootstrap is in progress, wait or skip. Applies whether or not we ever go multi-process. |
+| License | **GPL-3 + Section 7(b) UI-attribution rider** | See [LICENSE](LICENSE). Strong copyleft, source disclosure on distribution, plus a requirement that derivative works with a UI display attribution to this project. Telemetry is intentionally absent. |
+| Telemetry | **None** | No usage stats, no error reporting service, no opt-in/opt-out machinery. Bugs come in through GitHub issues. |
+| Prior art | **Start clean, audit before scaffolding** | Existing Logos VS Code extensions are language-config-only. Our scope is much larger. Audit the marketplace before scaffolding to confirm and to borrow grammar/snippet ideas, but don't fork. |
 
 ## Standalone (no-project) behavior
 
-The extension is **not just a project-aware LSP**. It must work usefully on *any* `.x`, `.xm`, `.m`, `.mm`, or `.h` file the user opens — including files outside any workspace, and including files transitively reached by cmd-clicking through `#import`s (e.g., the user is now browsing `Foundation.h` inside an SDK directory and wants to cmd-click `<CoreFoundation/CFBase.h>` from there). This section defines that contract. The seed of this requirement is [init.md](init.md#L11) ("even for headers outside the project…"), but it's broader than imports — it applies to type resolution too.
+The extension is **not just a project-aware LSP**. It must work usefully on *any* `.x`, `.xm`, `.m`, `.mm`, or `.h` file the user opens — including files outside any workspace, and including files transitively reached by cmd-clicking through `#import`s (e.g., the user is now browsing `Foundation.h` inside an SDK directory and wants to cmd-click `<CoreFoundation/CFBase.h>` from there). This section defines that contract. The seed of this requirement is feature #1 above ("even for headers outside the project…"), but it's broader than imports — it applies to type resolution too.
 
 ### Files in scope
 
@@ -194,8 +263,9 @@ The fresh clone lives at `~/Developer/theos` (cloned with `--recursive`). Treat 
 - **Detect a Theos project** by, in order: `$THEOS` env set + `Makefile` referencing `$THEOS/makefiles/*`, then look for a project-local `theos` symlink, then look for `control` + `Makefile` shape. Don't require all signals.
 - **Make the Theos path configurable** in extension settings. Default to `$THEOS` env, fall back to `/opt/theos` only as a last resort. For development of *this LSP*, point it at `~/Developer/theos`.
 - **Keep the Logos parser separate** from the clangd proxy. A user editing a `.x` file should get Logos diagnostics even when clangd is unavailable (no compile_commands yet).
-- **Use a TextMate grammar** for syntax highlighting (#7 in [init.md](init.md)). Reference the vim file in `extras/vim/` as a starting point.
+- **Use a TextMate grammar** for syntax highlighting (#7). Reference the vim file in `extras/vim/` as a starting point.
 - **Cache the generated `.m`** keyed by file content hash. `logos.pl` is fast but not free, and you'll re-run it on every keystroke if you're not careful.
+- **Audit existing Logos VS Code extensions before scaffolding** — to confirm none cover the same scope, and to borrow grammar/snippet ideas. Don't fork them.
 - **Implement features in phases** (see below). Don't try to ship all 26 items at once.
 
 ## Don'ts
@@ -209,6 +279,7 @@ The fresh clone lives at `~/Developer/theos` (cloned with `--recursive`). Treat 
 - **Don't write column-precise reverse mapping in v1.** `#line` is line-only and that's good enough for diagnostics/hover/most jumps. Defer column mapping until a feature actually needs it (likely rename / find-refs span highlighting).
 - **Don't run `make` on every keystroke.** That rebuilds everything. For live diagnostics, invoke `logos.pl` directly and hand the result to clangd's `textDocument/didChange` with the recorded compile command from `compile_commands.json`.
 - **Don't ship without a fallback** for non-Theos workspaces. The extension should at least give syntax highlighting and Logos keyword completion when no Theos is detected.
+- **Don't add telemetry** of any kind. No usage stats, no error reporting service. Bugs come in through GitHub issues.
 
 ## Gotchas
 
@@ -238,7 +309,7 @@ The fresh clone lives at `~/Developer/theos` (cloned with `--recursive`). Treat 
 
 11. **Theos isn't always in `$THEOS`.** Some users put it in a project-local `./theos` symlink. The Makefile resolution is what matters; mirror its logic rather than reading `$THEOS` directly.
 
-12. **`nic.pl` is interactive.** For the "new project" command (#23 in init.md), drive it via stdin or rewrite the prompting in the extension and call `nic.pl` non-interactively. Look at how others (e.g. theos-jailed, dragoma) script it.
+12. **`nic.pl` is interactive.** For the "new project" command (#23), drive it via stdin or rewrite the prompting in the extension and call `nic.pl` non-interactively. Look at how others (e.g. theos-jailed, dragoma) script it.
 
 13. **Xcode SDK paths are not stable.** Always resolve via `xcrun --sdk <name> --show-sdk-path`. Hardcoded `/Applications/Xcode.app/...` breaks for users on Xcode-beta or non-default install locations. Cache the result for the session.
 
@@ -248,9 +319,9 @@ The fresh clone lives at `~/Developer/theos` (cloned with `--recursive`). Treat 
 
 16. **VS Code marks files outside the workspace read-only by default.** Good — we want that. But clangd will still index them; make sure file watchers don't try to write back to them.
 
-17. **Theos vendor PrivateFrameworks coverage is incomplete.** Many private classes have no header anywhere. Go-to-def will fail for them, which is expected. Don't show a scary error — just silently fail or show "no definition found." Optionally, fall back to a class-dump-on-demand for `%hook ClassName` cases (Phase 3 feature, item #15 in init.md).
+17. **Theos vendor PrivateFrameworks coverage is incomplete.** Many private classes have no header anywhere. Go-to-def will fail for them, which is expected. Don't show a scary error — just silently fail or show "no definition found." Optionally, fall back to a class-dump-on-demand for `%hook ClassName` cases (Phase 3 feature, #15).
 
-18. **We do not write an indexer; clangd does.** What we *do* write is the **SDK index bootstrap** — the synthetic-TU machinery that induces clangd to index the SDK headers in the first place. See [SDK index bootstrap](#sdk-index-bootstrap) below. The first-run cost (minutes of CPU, ~100 MB of disk) lands on clangd, not on us. Our responsibility is correctness of the synthetic compile commands and good UX around progress and cancellation.
+18. **We do not write an indexer; clangd does.** What we *do* write is the **SDK index bootstrap** — the synthetic-TU machinery that induces clangd to index the SDK headers in the first place. See [SDK index bootstrap](#sdk-index-bootstrap). The first-run cost (minutes of CPU, ~100 MB of disk) lands on clangd, not on us. Our responsibility is correctness of the synthetic compile commands and good UX around progress and cancellation.
 
 ## Suggested phases
 
@@ -299,15 +370,24 @@ Standalone behavior must work end-to-end at the end of 2a, before any project-mo
 
 ## Concrete first task for the next agent
 
-1. Initialize a Node + TypeScript VS Code extension scaffold in this repo (`npm init`, `yo code`-style structure, `package.json` with `contributes.languages` for `logos`).
-2. Build the TextMate grammar for `.x` files. Reference [theos/vendor/logos/extras/vim/](../theos/vendor/logos/extras/vim/).
-3. Wire up a minimal LSP (language-server-protocol over stdio) that publishes the unclosed-`%hook` diagnostic. This proves the plumbing.
-4. **Verify the standalone contract early.** Open a `.x` file in a folder with no Makefile and confirm Phase 1 features all work. If anything in the "No project" column of the capability matrix doesn't work, fix it before moving on.
-5. Stop and check in with the user before starting Phase 2 — clangd integration is the architectural commitment and worth a checkpoint. Specifically flag the Phase 2a / 2b split for review.
+1. **Audit prior art on the VS Code marketplace.** Search for `logos`, `theos`, `tweak`. Confirm none cover this scope; note what exists for grammar/snippet inspiration. Don't fork.
+2. Initialize a Node + TypeScript VS Code extension scaffold in this repo (`npm init`, `yo code`-style structure, `package.json` with `contributes.languages` for `logos`).
+3. Build the TextMate grammar for `.x` files. Reference [theos/vendor/logos/extras/vim/](../theos/vendor/logos/extras/vim/).
+4. Wire up a minimal LSP (language-server-protocol over stdio) that publishes the unclosed-`%hook` diagnostic. This proves the plumbing.
+5. **Verify the standalone contract early.** Open a `.x` file in a folder with no Makefile and confirm Phase 1 features all work. If anything in the "No project" column of the capability matrix doesn't work, fix it before moving on.
+6. Stop and check in with the user before starting Phase 2 — clangd integration is the architectural commitment and worth a checkpoint. Specifically flag the Phase 2a / 2b split for review.
+
+## Explicitly out of scope for v1
+
+These are decided-deferred, not undecided. Don't pull them forward without checking in.
+
+- **Swift / Orion (`.x.swift`).** Requires SourceKit-LSP and a parallel proxy. Revisit after the Logos/ObjC side ships.
+- **Multi-root workspaces.** Assume one Theos project per workspace. A multi-root workspace will work in degraded form (only one root's `compile_commands.json` honored). Document the limitation.
+- **Telemetry.** No usage stats, no error reporting, no opt-in UI. Bug reports via GitHub.
+- **Pre-built SDK index distribution.** Each user's first run does its own bootstrap. Couples-version-to-extension-release is too painful to maintain.
 
 ## Reference paths
 
-- Spec: [init.md](init.md)
 - Theos clone (read-only): `~/Developer/theos`
 - Logos sources: `~/Developer/theos/vendor/logos/bin/`
 - Logos main script: [theos/vendor/logos/bin/logos.pl](../theos/vendor/logos/bin/logos.pl)
