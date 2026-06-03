@@ -29,6 +29,17 @@ Clangd owns:
 - SDK / framework header indexing
 - Real compile errors
 
+## Locked tech-stack decisions
+
+| Decision | Choice | Notes |
+|---|---|---|
+| LSP server runtime | **TypeScript, in-process with the extension** | Fastest to MVP, shares types with the extension, easy debugging. Future-extract to a standalone server if/when other editors matter. Multi-window state isn't a singleton; collisions on shared state are handled with file locks. |
+| Clangd distribution | **Download on first activation, pinned version** | Source: LLVM's GitHub releases. Verify checksums. Cache in extension global storage (~80 MB once). Pinning gives us version-consistent diagnostics across users — bug reports become tractable. |
+| Swift / Orion (`.x.swift`) | **Out of scope for v1** | Would require SourceKit-LSP and a parallel proxy. Revisit after the Logos/ObjC side ships solidly. The plan's phases assume ObjC only. |
+| Debugger backend | **Wrap CodeLLDB (`vadimcn.vscode-lldb`)** | Declare as a VS Code extension dependency. Our work is launch.json templates, SSH/iproxy/debugserver plumbing, device manager, and a "Debug This Tweak" command. CodeLLDB owns the DAP surface. |
+| Language ID | **`logos`** | Single ID for `.x` / `.xm` / `.xi` / `.xmi`. Embedded ObjC scopes inherit from `source.objc.*`. Default; revisit only if it collides with another extension. |
+| Multi-window safety | **File lock on shared cache** | The SDK index bootstrap cache is shared across VS Code windows. Acquire a lock; if another window's bootstrap is in progress, wait or skip. Applies whether or not we ever go multi-process. |
+
 ## Standalone (no-project) behavior
 
 The extension is **not just a project-aware LSP**. It must work usefully on *any* `.x`, `.xm`, `.m`, `.mm`, or `.h` file the user opens — including files outside any workspace, and including files transitively reached by cmd-clicking through `#import`s (e.g., the user is now browsing `Foundation.h` inside an SDK directory and wants to cmd-click `<CoreFoundation/CFBase.h>` from there). This section defines that contract. The seed of this requirement is [init.md](init.md#L11) ("even for headers outside the project…"), but it's broader than imports — it applies to type resolution too.
@@ -91,6 +102,7 @@ Strategy:
 3. **Write a synthetic `compile_commands.json`** alongside the stubs, with `-isysroot`, `-F`, `-x objective-c`, and ARC enabled for each TU.
 4. **Hand it to clangd.** Clangd indexes in the background, writes `.idx` files, persists.
 5. **Cache the bootstrap output** by `(SDK identifier, SDK version hash, generator script version)`. Subsequent activations check the cache and skip if valid.
+6. **Lock the cache during writes.** The bootstrap directory is shared across VS Code windows. Acquire an advisory file lock before writing stubs or running the bootstrap pass. If another window holds the lock, wait or skip — never write concurrently. Clangd's per-project index (`.cache/clangd/index/`) has the same shared-state risk; rely on clangd's own atomic shard writes there, but document the assumption.
 
 #### When
 
@@ -254,7 +266,8 @@ Each phase ends in a shippable extension. Don't move on until the current one is
 - Works on *any* opened file regardless of workspace (the standalone-mode floor — see capability matrix above for what's "yes" in the "No project" column)
 
 **Phase 2 — clangd integration (standalone first, then project)**
-- Spawn clangd as a child process. Single clangd instance, even in standalone mode.
+- **Clangd acquisition first.** On first activation, download the pinned clangd build from LLVM's GitHub releases into extension global storage. Verify checksum. Show progress. Cache. Subsequent activations reuse the cached binary. Surface a setting to override with a user-supplied path for power users.
+- Spawn clangd as a child process. Single clangd instance per window, even in standalone mode.
 - **2a — Standalone path resolution.** Synthesize fallback compile commands per the recipe in [Standalone behavior](#standalone-no-project-behavior). Implement `#import` cmd-click for all four file-in-scope cases (loose `.x`, workspace `.h`, transitive `.h`, inside-SDK `.h`). Implement inside-SDK detection. Persistent SDK index at `~/.cache/logos-lsp/clangd-index/`. Go-to-def on SDK types must work with no project. (#1, partial #2, #13)
 - **2b — Project layer.** When `compile_commands.json` is present, prefer it over the synthesized fallback. Run `logos.pl` to produce `.m` for `.x`/`.xm` files; feed to clangd. Proxy `textDocument/publishDiagnostics` with `.m` → `.x` path swap (line numbers come from `#line` for free). Proxy hover, completion, go-to-def for project ObjC code. Project symbol completion (#2 full, #13).
 
@@ -275,7 +288,7 @@ Standalone behavior must work end-to-end at the end of 2a, before any project-mo
 
 **Phase 5 — debug + device**
 - SSH device manager (#20)
-- LLDB-based debugger integration (#6) — probably via `vadimcn.vscode-lldb` as a backend
+- LLDB-based debugger integration (#6) — backed by **CodeLLDB** (`vadimcn.vscode-lldb`), declared as an extension dependency in `package.json`. Our work is launch.json templates (`attach` to `connect: tcp://device:port`), the iproxy/SSH tunnel setup, and a "Debug This Tweak" command that handles install → debugserver → attach. CodeLLDB owns the DAP plumbing.
 - Live tweak log viewer (#21)
 - Crash log symbolication (#22)
 
